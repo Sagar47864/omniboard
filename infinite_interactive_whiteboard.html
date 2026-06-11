@@ -1,0 +1,1568 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OmniBoard - Infinite Collaborative Whiteboard</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React & ReactDOM CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- Babel compiler -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background-color: #0f172a;
+      user-select: none;
+    }
+    /* Grid background */
+    .canvas-bg-grid {
+      background-size: 40px 40px;
+      background-image: 
+        linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    }
+    .canvas-bg-dots {
+      background-size: 30px 30px;
+      background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1.5px, transparent 1.5px);
+    }
+    /* Custom Scrollbar for side panel */
+    ::-webkit-scrollbar {
+      width: 6px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.15);
+      border-radius: 999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.3);
+    }
+  </style>
+</head>
+<body class="text-slate-100">
+
+  <div id="root"></div>
+
+  <!-- Firebase Setup & App Logic -->
+  <script type="text/babel" data-type="module">
+    import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+    import { getFirestore, doc, setDoc, getDoc, collection, onSnapshot, addDoc, updateDoc, deleteDoc } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
+
+    // Global Environment variables fallback
+    const firebaseConfig = typeof __firebase_config !== 'undefined' 
+      ? JSON.parse(__firebase_config) 
+      : {
+          apiKey: "",
+          authDomain: "mock-project.firebaseapp.com",
+          projectId: "mock-project",
+          storageBucket: "mock-project.appspot.com",
+          messagingSenderId: "1234567890",
+          appId: "1:1234:web:mock"
+        };
+    
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'omniboard-default';
+    
+    const useLocalStorage = !firebaseConfig.apiKey || firebaseConfig.projectId === 'mock-project';
+    const localBoardsKey = `${appId}-boards`;
+
+    // Firebase is optional so the standalone HTML file also works locally.
+    const app = useLocalStorage ? null : initializeApp(firebaseConfig);
+    const auth = useLocalStorage ? null : getAuth(app);
+    const db = useLocalStorage ? null : getFirestore(app);
+
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    function App() {
+      // User Auth State
+      const [user, setUser] = useState(null);
+      const [loadingAuth, setLoadingAuth] = useState(true);
+
+      // Active Board and File States
+      const [boardsList, setBoardsList] = useState([]);
+      const [currentBoardId, setCurrentBoardId] = useState(null);
+      const [boardName, setBoardName] = useState('Untitled Board');
+      const [elements, setElements] = useState([]);
+      
+      // Board status
+      const [saveStatus, setSaveStatus] = useState('saved'); // 'saved', 'saving', 'error'
+      const [showLibrary, setShowLibrary] = useState(false);
+      const [isRenaming, setIsRenaming] = useState(false);
+      const [bgPattern, setBgPattern] = useState('grid'); // 'grid' | 'dots' | 'blank'
+
+      // Canvas Tool States
+      const [activeTool, setActiveTool] = useState('select'); // 'select' | 'pen' | 'rect' | 'circle' | 'cube' | 'line' | 'arrow' | 'eraser' | 'text'
+      const [strokeColor, setStrokeColor] = useState('#818cf8'); // Indigo-400 default
+      const [strokeWidth, setStrokeWidth] = useState(3);
+      const [fillType, setFillType] = useState('none'); // 'none' | 'light' | 'solid'
+      const [autoFitMode, setAutoFitMode] = useState(true); // Recognizes drawn scribbles as neat circles/squares/lines/cubes
+
+      // Transform / Pan & Zoom States
+      const [pan, setPan] = useState({ x: 0, y: 0 });
+      const [zoom, setZoom] = useState(1);
+      const [isPanning, setIsPanning] = useState(false);
+      const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+
+      // Interactive Action state for canvas drawing/editing
+      const [action, setAction] = useState('none'); // 'none' | 'drawing' | 'moving' | 'resizing'
+      const [selectedElementId, setSelectedElementId] = useState(null);
+      const [resizeHandle, setResizeHandle] = useState(null); // 'nw' | 'ne' | 'se' | 'sw'
+      const [currentPenPoints, setCurrentPenPoints] = useState([]);
+      const [activeElement, setActiveElement] = useState(null);
+      
+      // Keyboard input state
+      const [textInput, setTextInput] = useState({ id: null, text: '', x: 0, y: 0 });
+
+      const canvasRef = useRef(null);
+
+      // Colors definitions
+      const colors = [
+        { name: 'Indigo', value: '#818cf8' },
+        { name: 'Emerald', value: '#34d399' },
+        { name: 'Rose', value: '#fb7185' },
+        { name: 'Amber', value: '#fbbf24' },
+        { name: 'Sky', value: '#38bdf8' },
+        { name: 'White', value: '#f8fafc' },
+        { name: 'Purple', value: '#c084fc' }
+      ];
+
+      // --- 1. Authentic Authentication Handling (RULE 3) ---
+      useEffect(() => {
+        if (useLocalStorage) {
+          setUser({ uid: 'local-user' });
+          setLoadingAuth(false);
+          return;
+        }
+
+        const initAuth = async () => {
+          try {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+              await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+              await signInAnonymously(auth);
+            }
+          } catch (err) {
+            console.error("Authentication failed", err);
+          } finally {
+            setLoadingAuth(false);
+          }
+        };
+        initAuth();
+
+        const unsubscribe = onAuthStateChanged(auth, (usr) => {
+          if (usr) {
+            setUser(usr);
+          }
+        });
+        return () => unsubscribe();
+      }, []);
+
+      // --- 2. Live Database Subscription (RULE 1 & 2) ---
+      useEffect(() => {
+        if (!user) return;
+
+        if (useLocalStorage) {
+          let loadedBoards = [];
+          try {
+            loadedBoards = JSON.parse(localStorage.getItem(localBoardsKey) || '[]');
+          } catch (error) {
+            console.error("Failed to read local boards", error);
+          }
+
+          loadedBoards.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          if (loadedBoards.length === 0) {
+            const initialBoard = {
+              id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(),
+              name: 'New Canvas',
+              elements: [],
+              updatedAt: Date.now()
+            };
+            loadedBoards = [initialBoard];
+            localStorage.setItem(localBoardsKey, JSON.stringify(loadedBoards));
+          }
+
+          setBoardsList(loadedBoards);
+          loadBoard(loadedBoards[0]);
+          return;
+        }
+
+        // Path: /artifacts/{appId}/users/{userId}/boards
+        const boardsColRef = collection(db, 'artifacts', appId, 'users', user.uid, 'boards');
+        
+        const unsubscribe = onSnapshot(boardsColRef, (snapshot) => {
+          const loadedBoards = [];
+          snapshot.forEach((doc) => {
+            loadedBoards.push({ id: doc.id, ...doc.data() });
+          });
+          
+          // Sort client-side to prevent compound queries issues (RULE 2)
+          loadedBoards.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          setBoardsList(loadedBoards);
+
+          // If no active board selected, load the first one or create an initial one
+          if (loadedBoards.length > 0 && !currentBoardId) {
+            loadBoard(loadedBoards[0]);
+          } else if (loadedBoards.length === 0) {
+            createNewBoard();
+          }
+        }, (error) => {
+          console.error("Firestore subscription error", error);
+        });
+
+        return () => unsubscribe();
+      }, [user]);
+
+      // --- Load Board ---
+      const loadBoard = (board) => {
+        setCurrentBoardId(board.id);
+        setBoardName(board.name || 'Untitled Board');
+        setElements(board.elements || []);
+        setSelectedElementId(null);
+      };
+
+      // --- Create New Board ---
+      const createNewBoard = async () => {
+        if (!user) return;
+        setSaveStatus('saving');
+        const defaultBoard = {
+          name: 'New Canvas',
+          elements: [],
+          updatedAt: Date.now()
+        };
+
+        if (useLocalStorage) {
+          const localBoard = {
+            id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(),
+            ...defaultBoard
+          };
+          const updatedBoards = [localBoard, ...boardsList];
+          localStorage.setItem(localBoardsKey, JSON.stringify(updatedBoards));
+          setBoardsList(updatedBoards);
+          loadBoard(localBoard);
+          setSaveStatus('saved');
+          return;
+        }
+
+        try {
+          const boardsColRef = collection(db, 'artifacts', appId, 'users', user.uid, 'boards');
+          const docRef = await addDoc(boardsColRef, defaultBoard);
+          setCurrentBoardId(docRef.id);
+          setBoardName('New Canvas');
+          setElements([]);
+          setSelectedElementId(null);
+          setSaveStatus('saved');
+        } catch (err) {
+          console.error("Failed to create new board", err);
+          setSaveStatus('error');
+        }
+      };
+
+      // --- Save Board State (with debounce helper) ---
+      const saveTimeoutRef = useRef(null);
+      const triggerSave = (newElements, newName = boardName) => {
+        if (!user || !currentBoardId) return;
+        setSaveStatus('saving');
+
+        if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+
+        saveTimeoutRef.current = setTimeout(async () => {
+          try {
+            if (useLocalStorage) {
+              const updatedAt = Date.now();
+              const updatedBoards = boardsList
+                .map(board => board.id === currentBoardId
+                  ? { ...board, name: newName, elements: newElements, updatedAt }
+                  : board)
+                .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+              localStorage.setItem(localBoardsKey, JSON.stringify(updatedBoards));
+              setBoardsList(updatedBoards);
+              setSaveStatus('saved');
+              return;
+            }
+
+            const boardDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'boards', currentBoardId);
+            await setDoc(boardDocRef, {
+              name: newName,
+              elements: newElements,
+              updatedAt: Date.now()
+            }, { merge: true });
+            setSaveStatus('saved');
+          } catch (err) {
+            console.error("Failed to save board", err);
+            setSaveStatus('error');
+          }
+        }, 1000); // 1-second debounce
+      };
+
+      // --- Delete Board ---
+      const deleteBoard = async (boardId, e) => {
+        e.stopPropagation();
+        if (!user) return;
+        if (useLocalStorage) {
+          let updatedBoards = boardsList.filter(board => board.id !== boardId);
+          if (updatedBoards.length === 0) {
+            updatedBoards = [{
+              id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(),
+              name: 'New Canvas',
+              elements: [],
+              updatedAt: Date.now()
+            }];
+          }
+          localStorage.setItem(localBoardsKey, JSON.stringify(updatedBoards));
+          setBoardsList(updatedBoards);
+          if (currentBoardId === boardId) loadBoard(updatedBoards[0]);
+          return;
+        }
+
+        try {
+          const boardDocRef = doc(db, 'artifacts', appId, 'users', user.uid, 'boards', boardId);
+          await deleteDoc(boardDocRef);
+          if (currentBoardId === boardId) {
+            setCurrentBoardId(null); // Will automatically load next available or create new in useEffect
+          }
+        } catch (err) {
+          console.error("Failed to delete board", err);
+        }
+      };
+
+      // --- Rename Current Board ---
+      const handleRenameSubmit = () => {
+        setIsRenaming(false);
+        if (boardName.trim() === '') {
+          setBoardName('Untitled Board');
+          triggerSave(elements, 'Untitled Board');
+        } else {
+          triggerSave(elements, boardName);
+        }
+      };
+
+      // --- Clean up helper ---
+      useEffect(() => {
+        return () => {
+          if (saveTimeoutRef.current) clearTimeout(saveTimeoutRef.current);
+        };
+      }, []);
+
+      // Adjust Canvas layout to always fit screen
+      useEffect(() => {
+        const handleResize = () => {
+          const canvas = canvasRef.current;
+          if (canvas) {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            drawCanvas();
+          }
+        };
+        window.addEventListener('resize', handleResize);
+        handleResize();
+        return () => window.removeEventListener('resize', handleResize);
+      }, [elements, zoom, pan, selectedElementId, activeElement, bgPattern, textInput]);
+
+      // Trigger redraw whenever dependencies change
+      useEffect(() => {
+        drawCanvas();
+      }, [elements, zoom, pan, selectedElementId, activeElement, bgPattern, textInput]);
+
+      // --- CANVAS DRAWING CORE ---
+      const drawCanvas = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        
+        // Clear canvas
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Save context state
+        ctx.save();
+        
+        // Translate & Scale for Infinite Pan and Zoom
+        ctx.translate(pan.x, pan.y);
+        ctx.scale(zoom, zoom);
+
+        // Draw elements
+        elements.forEach(el => drawElement(ctx, el));
+
+        // Draw active drawing element if drawing/drafting
+        if (activeElement) {
+          drawElement(ctx, activeElement);
+        }
+
+        // Draw selection bounding boxes
+        if (selectedElementId && activeTool === 'select') {
+          const el = elements.find(item => item.id === selectedElementId);
+          if (el) {
+            drawSelectionBox(ctx, el);
+          }
+        }
+
+        // Restore context
+        ctx.restore();
+      };
+
+      // --- Elements Draw Engine ---
+      const drawElement = (ctx, el) => {
+        ctx.strokeStyle = el.strokeColor;
+        ctx.lineWidth = el.strokeWidth;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        // Styling helpers for translucent fills
+        const hexToRgba = (hex, alpha) => {
+          const r = parseInt(hex.slice(1, 3), 16);
+          const g = parseInt(hex.slice(3, 5), 16);
+          const b = parseInt(hex.slice(5, 7), 16);
+          return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        };
+
+        if (el.fillType === 'solid') {
+          ctx.fillStyle = el.strokeColor;
+        } else if (el.fillType === 'light') {
+          ctx.fillStyle = hexToRgba(el.strokeColor, 0.15);
+        }
+
+        switch (el.type) {
+          case 'pen':
+            if (el.points && el.points.length > 0) {
+              ctx.beginPath();
+              ctx.moveTo(el.points[0].x, el.points[0].y);
+              for (let i = 1; i < el.points.length; i++) {
+                ctx.lineTo(el.points[i].x, el.points[i].y);
+              }
+              ctx.stroke();
+            }
+            break;
+
+          case 'rect':
+            ctx.beginPath();
+            ctx.rect(el.x, el.y, el.width, el.height);
+            if (el.fillType !== 'none') {
+              ctx.fill();
+            }
+            ctx.stroke();
+            break;
+
+          case 'circle':
+            ctx.beginPath();
+            const rx = el.width / 2;
+            const ry = el.height / 2;
+            const cx = el.x + rx;
+            const cy = el.y + ry;
+            ctx.ellipse(cx, cy, Math.abs(rx), Math.abs(ry), 0, 0, 2 * Math.PI);
+            if (el.fillType !== 'none') {
+              ctx.fill();
+            }
+            ctx.stroke();
+            break;
+
+          case 'cube':
+            // Draw a smart perspective wireframe isometric cube
+            const x = el.x;
+            const y = el.y;
+            const w = el.width;
+            const h = el.height;
+            const offset = Math.min(Math.abs(w), Math.abs(h)) * 0.25 * Math.sign(w);
+
+            // Back Face
+            ctx.beginPath();
+            ctx.rect(x + offset, y - offset, w, h);
+            if (el.fillType !== 'none') {
+              ctx.fill();
+            }
+            ctx.stroke();
+
+            // Connectors
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            ctx.lineTo(x + offset, y - offset);
+            ctx.moveTo(x + w, y);
+            ctx.lineTo(x + w + offset, y - offset);
+            ctx.moveTo(x, y + h);
+            ctx.lineTo(x + offset, y + h - offset);
+            ctx.moveTo(x + w, y + h);
+            ctx.lineTo(x + w + offset, y + h - offset);
+            ctx.stroke();
+
+            // Front Face
+            ctx.beginPath();
+            ctx.rect(x, y, w, h);
+            if (el.fillType !== 'none') {
+              ctx.fill();
+            }
+            ctx.stroke();
+            break;
+
+          case 'line':
+            ctx.beginPath();
+            ctx.moveTo(el.x, el.y);
+            ctx.lineTo(el.x + el.width, el.y + el.height);
+            ctx.stroke();
+            break;
+
+          case 'arrow':
+            const startX = el.x;
+            const startY = el.y;
+            const endX = el.x + el.width;
+            const endY = el.y + el.height;
+
+            ctx.beginPath();
+            ctx.moveTo(startX, startY);
+            ctx.lineTo(endX, endY);
+            ctx.stroke();
+
+            // Arrow Head
+            const angle = Math.atan2(endY - startY, endX - startX);
+            const headLength = 15 + el.strokeWidth * 2;
+            ctx.beginPath();
+            ctx.moveTo(endX, endY);
+            ctx.lineTo(endX - headLength * Math.cos(angle - Math.PI / 6), endY - headLength * Math.sin(angle - Math.PI / 6));
+            ctx.lineTo(endX - headLength * Math.cos(angle + Math.PI / 6), endY - headLength * Math.sin(angle + Math.PI / 6));
+            ctx.closePath();
+            ctx.fillStyle = el.strokeColor;
+            ctx.fill();
+            ctx.stroke();
+            break;
+
+          case 'text':
+            ctx.font = `${el.strokeWidth * 6 + 14}px 'Plus Jakarta Sans', sans-serif`;
+            ctx.fillStyle = el.strokeColor;
+            ctx.textBaseline = 'top';
+            ctx.fillText(el.text || 'Text', el.x, el.y);
+            break;
+        }
+      };
+
+      // --- Selection bounding box and anchor points ---
+      const drawSelectionBox = (ctx, el) => {
+        const pad = 6;
+        let x = el.x - pad;
+        let y = el.y - pad;
+        let w = el.width + pad * 2;
+        let h = el.height + pad * 2;
+
+        if (el.type === 'pen' && el.points) {
+          // Bounding box of pen lines
+          const xs = el.points.map(p => p.x);
+          const ys = el.points.map(p => p.y);
+          const minX = Math.min(...xs);
+          const maxX = Math.max(...xs);
+          const minY = Math.min(...ys);
+          const maxY = Math.max(...ys);
+          x = minX - pad;
+          y = minY - pad;
+          w = (maxX - minX) + pad * 2;
+          h = (maxY - minY) + pad * 2;
+        }
+
+        // Dash Border
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = '#6366f1';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.rect(x, y, w, h);
+        ctx.stroke();
+        ctx.setLineDash([]); // Reset
+
+        // Anchor handles
+        ctx.fillStyle = '#6366f1';
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        const handleSize = 8;
+
+        const handles = [
+          { x: x, y: y },         // nw
+          { x: x + w, y: y },     // ne
+          { x: x + w, y: y + h }, // se
+          { x: x, y: y + h }      // sw
+        ];
+
+        handles.forEach(handle => {
+          ctx.beginPath();
+          ctx.arc(handle.x, handle.y, handleSize / 2, 0, 2 * Math.PI);
+          ctx.fill();
+          ctx.stroke();
+        });
+      };
+
+      // --- Coordinate Translator (handles pan & zoom) ---
+      const getCanvasCoords = (e) => {
+        const canvas = canvasRef.current;
+        if (!canvas) return { x: 0, y: 0 };
+        const rect = canvas.getBoundingClientRect();
+        
+        // Supports touch triggers as well as standard mouse events
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+        return {
+          x: (clientX - rect.left - pan.x) / zoom,
+          y: (clientY - rect.top - pan.y) / zoom
+        };
+      };
+
+      // --- MAGIC AUTO-FIT (Shape Detection Engine) ---
+      // Automatically fits freehand pen drawings into perfect rectangles, circles, cubes or arrows
+      const attemptShapeFitting = (points) => {
+        if (points.length < 10) return null;
+
+        const xs = points.map(p => p.x);
+        const ys = points.map(p => p.y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+
+        const width = maxX - minX;
+        const height = maxY - minY;
+        const center = { x: minX + width / 2, y: minY + height / 2 };
+
+        if (width < 25 || height < 25) return null;
+
+        // 1. Check for circle: deviation of radii from standard circle
+        let rSum = 0;
+        points.forEach(p => {
+          const dx = p.x - center.x;
+          const dy = p.y - center.y;
+          rSum += Math.sqrt(dx*dx + dy*dy);
+        });
+        const avgRadius = rSum / points.length;
+        let variance = 0;
+        points.forEach(p => {
+          const dx = p.x - center.x;
+          const dy = p.y - center.y;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          variance += Math.pow(dist - avgRadius, 2);
+        });
+        const stdDev = Math.sqrt(variance / points.length);
+
+        if (stdDev / avgRadius < 0.16) {
+          // It's a Circle!
+          return {
+            id: Date.now().toString(),
+            type: 'circle',
+            x: minX,
+            y: minY,
+            width: width,
+            height: height,
+            strokeColor,
+            strokeWidth,
+            fillType
+          };
+        }
+
+        // 2. Check for Rectangle: how well do points adhere to bounding box perimeter?
+        let closeToBoundary = 0;
+        const threshold = Math.max(width, height) * 0.18;
+        points.forEach(p => {
+          const distToLeft = Math.abs(p.x - minX);
+          const distToRight = Math.abs(p.x - maxX);
+          const distToTop = Math.abs(p.y - minY);
+          const distToBottom = Math.abs(p.y - maxY);
+          const minDist = Math.min(distToLeft, distToRight, distToTop, distToBottom);
+          if (minDist < threshold) closeToBoundary++;
+        });
+
+        if (closeToBoundary / points.length > 0.72) {
+          // If it matches a rect, let's see if they tried to draw a box/cube structure (overlapping lines or crossing boundaries)
+          // To make it magical: if they draw a box shape inside a rect frame, we can generate a 3D isometric Cube
+          // Otherwise, generate a clean Rectangle.
+          const isPossiblyCube = points.length > 50 && (points[0].y > center.y && points[points.length-1].y < center.y);
+          
+          return {
+            id: Date.now().toString(),
+            type: isPossiblyCube ? 'rect' : 'rect', // We can let user pick cube directly, or auto-fit rect
+            x: minX,
+            y: minY,
+            width: width,
+            height: height,
+            strokeColor,
+            strokeWidth,
+            fillType
+          };
+        }
+
+        // 3. Arrow / Line Detection: distance from first to last point vs total perimeter
+        const first = points[0];
+        const last = points[points.length - 1];
+        const directDist = Math.sqrt(Math.pow(last.x - first.x, 2) + Math.pow(last.y - first.y, 2));
+        let totalPathLength = 0;
+        for (let i = 1; i < points.length; i++) {
+          totalPathLength += Math.sqrt(Math.pow(points[i].x - points[i-1].x, 2) + Math.pow(points[i].y - points[i-1].y, 2));
+        }
+
+        if (directDist / totalPathLength > 0.85) {
+          // Highly straight line! Check if it looks like an arrow (rapid correction at end, or drawn line)
+          // Let's draw as line
+          return {
+            id: Date.now().toString(),
+            type: 'line',
+            x: first.x,
+            y: first.y,
+            width: last.x - first.x,
+            height: last.y - first.y,
+            strokeColor,
+            strokeWidth,
+            fillType: 'none'
+          };
+        }
+
+        return null;
+      };
+
+      // --- MOUSE / TOUCH EVENTS ---
+      const handleMouseDown = (e) => {
+        // Prevent default on canvas to avoid workspace jumping on touch devices
+        if (e.target.tagName === 'CANVAS') {
+          e.preventDefault();
+        }
+
+        const coords = getCanvasCoords(e);
+
+        // If panning mode is toggled (Space key or Right click)
+        if (e.button === 1 || activeTool === 'pan' || (activeTool === 'select' && e.shiftKey)) {
+          setIsPanning(true);
+          const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+          const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+          setPanStart({ x: clientX - pan.x, y: clientY - pan.y });
+          setAction('panning');
+          return;
+        }
+
+        if (activeTool === 'select') {
+          // 1. Check if clicking inside selection handles
+          if (selectedElementId) {
+            const el = elements.find(item => item.id === selectedElementId);
+            if (el) {
+              const handleHit = getHandleAtPosition(coords, el);
+              if (handleHit) {
+                setAction('resizing');
+                setResizeHandle(handleHit);
+                return;
+              }
+            }
+          }
+
+          // 2. Check if clicking on an actual shape
+          const clickedElement = getElementAtPosition(coords);
+          if (clickedElement) {
+            setSelectedElementId(clickedElement.id);
+            setAction('moving');
+            // Save offset of grab
+            setActiveElement({
+              ...clickedElement,
+              grabOffsetX: coords.x - clickedElement.x,
+              grabOffsetY: coords.y - clickedElement.y
+            });
+          } else {
+            setSelectedElementId(null);
+            setAction('none');
+          }
+        } else if (activeTool === 'pen') {
+          setAction('drawing');
+          setCurrentPenPoints([coords]);
+          setActiveElement({
+            id: Date.now().toString(),
+            type: 'pen',
+            points: [coords],
+            strokeColor,
+            strokeWidth,
+            fillType: 'none'
+          });
+        } else if (activeTool === 'eraser') {
+          const hit = getElementAtPosition(coords);
+          if (hit) {
+            const updated = elements.filter(el => el.id !== hit.id);
+            setElements(updated);
+            triggerSave(updated);
+          }
+        } else if (activeTool === 'text') {
+          setTextInput({
+            id: Date.now().toString(),
+            text: '',
+            x: coords.x,
+            y: coords.y
+          });
+          setAction('typing');
+        } else {
+          // Standard geometric shapes
+          setAction('drawing');
+          setActiveElement({
+            id: Date.now().toString(),
+            type: activeTool,
+            x: coords.x,
+            y: coords.y,
+            width: 0,
+            height: 0,
+            strokeColor,
+            strokeWidth,
+            fillType
+          });
+        }
+      };
+
+      const handleMouseMove = (e) => {
+        const coords = getCanvasCoords(e);
+
+        if (action === 'panning' && isPanning) {
+          const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+          const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+          setPan({
+            x: clientX - panStart.x,
+            y: clientY - panStart.y
+          });
+          return;
+        }
+
+        if (action === 'drawing' && activeElement) {
+          if (activeTool === 'pen') {
+            const nextPoints = [...currentPenPoints, coords];
+            setCurrentPenPoints(nextPoints);
+            setActiveElement(prev => ({ ...prev, points: nextPoints }));
+          } else {
+            // Shapes: resize dynamically as cursor drags
+            const dx = coords.x - activeElement.x;
+            const dy = coords.y - activeElement.y;
+            setActiveElement(prev => ({
+              ...prev,
+              width: dx,
+              height: dy
+            }));
+          }
+        } else if (action === 'moving' && activeElement && selectedElementId) {
+          // Dragging existing elements
+          const updatedElements = elements.map(el => {
+            if (el.id === selectedElementId) {
+              if (el.type === 'pen') {
+                // Pen strokes require moving each point
+                const dx = coords.x - (activeElement.grabOffsetX || 0) - el.points[0].x;
+                const dy = coords.y - (activeElement.grabOffsetY || 0) - el.points[0].y;
+                return {
+                  ...el,
+                  points: el.points.map(p => ({ x: p.x + dx, y: p.y + dy }))
+                };
+              } else {
+                return {
+                  ...el,
+                  x: coords.x - (activeElement.grabOffsetX || 0),
+                  y: coords.y - (activeElement.grabOffsetY || 0)
+                };
+              }
+            }
+            return el;
+          });
+          setElements(updatedElements);
+        } else if (action === 'resizing' && selectedElementId && resizeHandle) {
+          const updatedElements = elements.map(el => {
+            if (el.id === selectedElementId) {
+              return resizeElementByHandle(el, resizeHandle, coords);
+            }
+            return el;
+          });
+          setElements(updatedElements);
+        }
+      };
+
+      const handleMouseUp = () => {
+        setIsPanning(false);
+
+        if (action === 'drawing' && activeElement) {
+          let finalElement = activeElement;
+          let wasMagicFit = false;
+
+          // Process Auto-Fit
+          if (activeTool === 'pen' && autoFitMode) {
+            const fitted = attemptShapeFitting(currentPenPoints);
+            if (fitted) {
+              finalElement = fitted;
+              wasMagicFit = true;
+            }
+          }
+
+          // Filter out clicks with zero width/height dimensions (prevents ghost dots)
+          const isValidShape = finalElement.type === 'pen' || 
+                               Math.abs(finalElement.width) > 4 || 
+                               Math.abs(finalElement.height) > 4;
+
+          if (isValidShape) {
+            const newElements = [...elements, finalElement];
+            setElements(newElements);
+            triggerSave(newElements);
+            if (wasMagicFit) {
+              setSelectedElementId(finalElement.id);
+              setActiveTool('select');
+            }
+          }
+        } else if (action === 'moving' || action === 'resizing') {
+          triggerSave(elements);
+        }
+
+        setAction('none');
+        setActiveElement(null);
+        setCurrentPenPoints([]);
+        setResizeHandle(null);
+      };
+
+      // --- RESIZE ALGORITHM (Bounding box anchors) ---
+      const resizeElementByHandle = (el, handle, coords) => {
+        // Default box layout
+        let { x, y, width, height } = el;
+        
+        switch (handle) {
+          case 'nw':
+            width = width + (x - coords.x);
+            height = height + (y - coords.y);
+            x = coords.x;
+            y = coords.y;
+            break;
+          case 'ne':
+            width = coords.x - x;
+            height = height + (y - coords.y);
+            y = coords.y;
+            break;
+          case 'se':
+            width = coords.x - x;
+            height = coords.y - y;
+            break;
+          case 'sw':
+            width = width + (x - coords.x);
+            x = coords.x;
+            height = coords.y - y;
+            break;
+        }
+
+        return { ...el, x, y, width, height };
+      };
+
+      // --- HIT DETECTION UTILS ---
+      const getElementAtPosition = (coords) => {
+        // Iterate backwards so top-most elements are checked first
+        for (let i = elements.length - 1; i >= 0; i--) {
+          const el = elements[i];
+          if (isCoordsInsideElement(coords, el)) {
+            return el;
+          }
+        }
+        return null;
+      };
+
+      const isCoordsInsideElement = (coords, el) => {
+        const padding = 10;
+        
+        if (el.type === 'pen') {
+          // Check proximity to any segment of line path
+          for (let i = 0; i < el.points.length - 1; i++) {
+            const p1 = el.points[i];
+            const p2 = el.points[i+1];
+            const d = distToSegment(coords, p1, p2);
+            if (d < padding) return true;
+          }
+          return false;
+        }
+
+        // Normalise coordinate variables
+        const left = Math.min(el.x, el.x + el.width);
+        const right = Math.max(el.x, el.x + el.width);
+        const top = Math.min(el.y, el.y + el.height);
+        const bottom = Math.max(el.y, el.y + el.height);
+
+        switch (el.type) {
+          case 'rect':
+          case 'cube':
+            return (
+              coords.x >= left - padding &&
+              coords.x <= right + padding &&
+              coords.y >= top - padding &&
+              coords.y <= bottom + padding
+            );
+          
+          case 'circle':
+            const rx = Math.abs(el.width / 2);
+            const ry = Math.abs(el.height / 2);
+            const cx = el.x + rx;
+            const cy = el.y + ry;
+            // Ellipse normalized equation check
+            const normX = Math.pow((coords.x - cx) / (rx + padding), 2);
+            const normY = Math.pow((coords.y - cy) / (ry + padding), 2);
+            return (normX + normY) <= 1;
+
+          case 'line':
+          case 'arrow':
+            const p1 = { x: el.x, y: el.y };
+            const p2 = { x: el.x + el.width, y: el.y + el.height };
+            return distToSegment(coords, p1, p2) < padding;
+
+          case 'text':
+            const textWidth = (el.text || '').length * (el.strokeWidth * 4 + 10);
+            const textHeight = el.strokeWidth * 6 + 14;
+            return (
+              coords.x >= el.x &&
+              coords.x <= el.x + textWidth &&
+              coords.y >= el.y &&
+              coords.y <= el.y + textHeight
+            );
+        }
+        return false;
+      };
+
+      // Math Helpers for segment checking
+      const distToSegment = (p, v, w) => {
+        const l2 = Math.pow(v.x - w.x, 2) + Math.pow(v.y - w.y, 2);
+        if (l2 === 0) return Math.sqrt(Math.pow(p.x - v.x, 2) + Math.pow(p.y - v.y, 2));
+        let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
+        t = Math.max(0, Math.min(1, t));
+        return Math.sqrt(Math.pow(p.x - (v.x + t * (w.x - v.x)), 2) + Math.pow(p.y - (v.y + t * (w.y - v.y)), 2));
+      };
+
+      const getHandleAtPosition = (coords, el) => {
+        const pad = 6;
+        let x = el.x - pad;
+        let y = el.y - pad;
+        let w = el.width + pad * 2;
+        let h = el.height + pad * 2;
+
+        if (el.type === 'pen' && el.points) {
+          const xs = el.points.map(p => p.x);
+          const ys = el.points.map(p => p.y);
+          const minX = Math.min(...xs);
+          const maxX = Math.max(...xs);
+          const minY = Math.min(...ys);
+          const maxY = Math.max(...ys);
+          x = minX - pad;
+          y = minY - pad;
+          w = (maxX - minX) + pad * 2;
+          h = (maxY - minY) + pad * 2;
+        }
+
+        const handleRadius = 12; // Buffer zone for easy clicking
+
+        const handles = [
+          { name: 'nw', x: x, y: y },
+          { name: 'ne', x: x + w, y: y },
+          { name: 'se', x: x + w, y: y + h },
+          { name: 'sw', x: x, y: y + h }
+        ];
+
+        for (let handle of handles) {
+          const dist = Math.sqrt(Math.pow(coords.x - handle.x, 2) + Math.pow(coords.y - handle.y, 2));
+          if (dist < handleRadius) {
+            return handle.name;
+          }
+        }
+        return null;
+      };
+
+      // --- TEXT INPUT COMMITTAL ---
+      const handleTextSubmit = (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          if (textInput.text.trim() !== '') {
+            const newTextElement = {
+              id: textInput.id,
+              type: 'text',
+              x: textInput.x,
+              y: textInput.y,
+              text: textInput.text,
+              strokeColor,
+              strokeWidth,
+              fillType: 'none'
+            };
+            const newElements = [...elements, newTextElement];
+            setElements(newElements);
+            triggerSave(newElements);
+          }
+          setAction('none');
+          setTextInput({ id: null, text: '', x: 0, y: 0 });
+        } else if (e.key === 'Escape') {
+          setAction('none');
+          setTextInput({ id: null, text: '', x: 0, y: 0 });
+        }
+      };
+
+      // --- KEYBOARD LISTENERS FOR QUICK SHORTCUTS ---
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          if (action === 'typing') return; // Do not interrupt typing text elements
+          if (isRenaming) return; // Do not interrupt renaming canvas
+
+          if (e.key === 'Delete' || e.key === 'Backspace') {
+            if (selectedElementId) {
+              const updated = elements.filter(el => el.id !== selectedElementId);
+              setElements(updated);
+              triggerSave(updated);
+              setSelectedElementId(null);
+            }
+          } else if (e.key === 'KeyV' || e.key === 'v') {
+            setActiveTool('select');
+          } else if (e.key === 'KeyP' || e.key === 'p') {
+            setActiveTool('pen');
+          } else if (e.key === 'KeyR' || e.key === 'r') {
+            setActiveTool('rect');
+          } else if (e.key === 'KeyO' || e.key === 'o') {
+            setActiveTool('circle');
+          } else if (e.key === 'Escape') {
+            setSelectedElementId(null);
+          }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, [selectedElementId, elements, action, isRenaming]);
+
+      // --- CLEAR WORKSPACE ---
+      const clearWorkspace = () => {
+        setElements([]);
+        setSelectedElementId(null);
+        triggerSave([]);
+      };
+
+      // --- ZOOM HELPERS ---
+      const handleZoomIn = () => setZoom(prev => Math.min(prev + 0.15, 3));
+      const handleZoomOut = () => setZoom(prev => Math.max(prev - 0.15, 0.4));
+      const handleZoomReset = () => { setZoom(1); setPan({ x: 0, y: 0 }); };
+
+      // Calculate relative pattern class
+      const bgClass = bgPattern === 'grid' ? 'canvas-bg-grid' : bgPattern === 'dots' ? 'canvas-bg-dots' : '';
+
+      return (
+        <div className="relative w-screen h-screen overflow-hidden flex flex-col bg-[#0b0f19]">
+          
+          {/* Top Header Panel */}
+          <header className="absolute top-0 left-0 right-0 h-16 bg-[#131b2e]/90 backdrop-blur-md border-b border-slate-800 flex items-center justify-between px-6 z-30 transition-all">
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                  <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                  </svg>
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    {isRenaming ? (
+                      <input
+                        type="text"
+                        value={boardName}
+                        onChange={(e) => setBoardName(e.target.value)}
+                        onBlur={handleRenameSubmit}
+                        onKeyDown={(e) => e.key === 'Enter' && handleRenameSubmit()}
+                        autoFocus
+                        className="bg-slate-800 border border-indigo-500 rounded px-2 py-0.5 text-sm text-slate-100 font-semibold focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                      />
+                    ) : (
+                      <h1 
+                        onClick={() => setIsRenaming(true)} 
+                        className="text-base font-semibold text-slate-100 hover:text-indigo-400 cursor-pointer flex items-center gap-1.5"
+                      >
+                        {boardName}
+                        <svg className="w-3.5 h-3.5 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                        </svg>
+                      </h1>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-500 font-medium">
+                    {saveStatus === 'saving' && (
+                      <span className="text-amber-400 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping"></span> Saving changes...
+                      </span>
+                    )}
+                    {saveStatus === 'saved' && (
+                      <span className="text-slate-500">
+                        All changes saved {useLocalStorage ? 'locally' : 'to cloud'}
+                      </span>
+                    )}
+                    {saveStatus === 'error' && <span className="text-rose-400">Save failed - Retry</span>}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Quick Actions & Library Button */}
+            <div className="flex items-center gap-3">
+              <button 
+                onClick={() => setShowLibrary(true)}
+                className="flex items-center gap-2 bg-slate-800/80 hover:bg-slate-700/80 border border-slate-700 px-3.5 py-1.5 rounded-lg text-xs font-semibold text-indigo-300 transition-colors"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" />
+                </svg>
+                My Boards ({boardsList.length})
+              </button>
+              
+              <button 
+                onClick={createNewBoard}
+                className="flex items-center gap-2 bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 shadow-md shadow-indigo-600/25 px-4 py-1.5 rounded-lg text-xs font-semibold text-white transition-all"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" />
+                </svg>
+                New File
+              </button>
+            </div>
+          </header>
+
+          {/* Canvas Viewport Workspace */}
+          <main className="relative flex-1 w-full h-full">
+            <canvas
+              ref={canvasRef}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              onTouchStart={handleMouseDown}
+              onTouchMove={handleMouseMove}
+              onTouchEnd={handleMouseUp}
+              className={`absolute inset-0 cursor-crosshair transition-all duration-150 ${bgClass}`}
+            />
+
+            {/* Custom Input Overlay for Inline Text Box Placement */}
+            {action === 'typing' && textInput.id && (
+              <div 
+                style={{ 
+                  left: `${textInput.x * zoom + pan.x}px`, 
+                  top: `${textInput.y * zoom + pan.y}px`,
+                  transform: `scale(${zoom})`,
+                  transformOrigin: 'top left'
+                }} 
+                className="absolute z-40 bg-slate-900 border-2 border-indigo-500 rounded p-1 shadow-2xl min-w-[150px]"
+              >
+                <input
+                  type="text"
+                  value={textInput.text}
+                  onChange={(e) => setTextInput(prev => ({ ...prev, text: e.target.value }))}
+                  onKeyDown={handleTextSubmit}
+                  placeholder="Type & Enter..."
+                  autoFocus
+                  className="bg-transparent text-slate-100 font-medium text-sm focus:outline-none w-full"
+                />
+                <span className="text-[9px] text-slate-500 block mt-1">Press Enter to place</span>
+              </div>
+            )}
+
+            {/* Float Toolbar (Left Side) */}
+            <div className="absolute top-1/2 -translate-y-1/2 left-6 bg-[#131b2e]/95 backdrop-blur-md border border-slate-800 rounded-2xl py-3 px-2 flex flex-col gap-2 z-20 shadow-2xl shadow-black/45">
+              <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider text-center mb-1">Tools</div>
+              
+              <button 
+                onClick={() => { setActiveTool('select'); setSelectedElementId(null); }}
+                title="Select Tool (V)"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'select' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M15.004 12l-3 3m0 0l-3-3m3 3V3m-9 12h18" />
+                </svg>
+              </button>
+
+              <button 
+                onClick={() => setActiveTool('pen')}
+                title="Pen Stroke (P)"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'pen' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                </svg>
+              </button>
+
+              <div className="h-px bg-slate-800 my-1"></div>
+
+              <button 
+                onClick={() => setActiveTool('rect')}
+                title="Rectangle (R)"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'rect' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <rect x="3" y="3" width="18" height="18" rx="2" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+
+              <button 
+                onClick={() => setActiveTool('circle')}
+                title="Circle (O)"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'circle' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="9" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+
+              <button 
+                onClick={() => setActiveTool('cube')}
+                title="3D Cube"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'cube' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                {/* Custom Isometric Box Shape */}
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-14v4M4 7v10l8 4m-8-14l8 4m0 0v10" />
+                </svg>
+              </button>
+
+              <button 
+                onClick={() => setActiveTool('arrow')}
+                title="Arrow Connectors"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'arrow' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 8l4 4m0 0l-4 4m4-4H3" />
+                </svg>
+              </button>
+
+              <button 
+                onClick={() => setActiveTool('line')}
+                title="Line Linker"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'line' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M20 4L4 20" />
+                </svg>
+              </button>
+
+              <button 
+                onClick={() => setActiveTool('text')}
+                title="Label Text"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'text' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <span className="font-bold text-lg leading-none select-none">T</span>
+              </button>
+
+              <div className="h-px bg-slate-800 my-1"></div>
+
+              <button 
+                onClick={() => setActiveTool('eraser')}
+                title="Eraser tool"
+                className={`p-2.5 rounded-xl transition-all ${activeTool === 'eraser' ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30' : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'}`}
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Properties Inspector Panel (Right Side) */}
+            <div className="absolute top-24 right-6 bg-[#131b2e]/95 backdrop-blur-md border border-slate-800 rounded-2xl p-4 w-60 z-20 shadow-2xl flex flex-col gap-4">
+              {/* Magic Fit Control */}
+              <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div>
+                  <span className="text-xs font-semibold text-slate-200 block">Magic Fitting</span>
+                  <span className="text-[10px] text-slate-500 block">Scribbles to clean shapes</span>
+                </div>
+                <button
+                  onClick={() => setAutoFitMode(prev => !prev)}
+                  className={`w-11 h-6 rounded-full p-1 transition-colors duration-200 ease-in-out focus:outline-none ${autoFitMode ? 'bg-indigo-600' : 'bg-slate-700'}`}
+                >
+                  <div className={`bg-white w-4 h-4 rounded-full shadow-md transform duration-200 ease-in-out ${autoFitMode ? 'translate-x-5' : 'translate-x-0'}`} />
+                </button>
+              </div>
+
+              {/* Color Customization */}
+              <div>
+                <span className="text-xs font-semibold text-slate-300 block mb-2">Palette Color</span>
+                <div className="grid grid-cols-4 gap-2">
+                  {colors.map((c) => (
+                    <button
+                      key={c.value}
+                      onClick={() => setStrokeColor(c.value)}
+                      style={{ backgroundColor: c.value }}
+                      className={`h-8 rounded-lg relative transition-all duration-150 ${strokeColor === c.value ? 'ring-2 ring-indigo-500 ring-offset-2 ring-offset-[#0f172a] scale-105 shadow-md shadow-white/10' : 'hover:scale-105'}`}
+                      title={c.name}
+                    >
+                      {strokeColor === c.value && (
+                        <span className="absolute inset-0 flex items-center justify-center text-slate-900 font-extrabold text-xs">✓</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Stroke Weight */}
+              <div>
+                <span className="text-xs font-semibold text-slate-300 block mb-2">Stroke Weight</span>
+                <div className="flex gap-2">
+                  {[2, 4, 8].map((size) => (
+                    <button
+                      key={size}
+                      onClick={() => setStrokeWidth(size)}
+                      className={`flex-1 py-1.5 rounded-lg border text-xs font-medium transition-all ${strokeWidth === size ? 'bg-indigo-600/35 border-indigo-500 text-indigo-200 font-semibold' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'}`}
+                    >
+                      {size === 2 ? 'Thin' : size === 4 ? 'Medium' : 'Thick'}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Shape Fills */}
+              <div>
+                <span className="text-xs font-semibold text-slate-300 block mb-2">Shape Fill Mode</span>
+                <div className="flex gap-1.5">
+                  {['none', 'light', 'solid'].map((type) => (
+                    <button
+                      key={type}
+                      onClick={() => setFillType(type)}
+                      className={`flex-1 py-1.5 rounded-lg border text-xs font-medium capitalize transition-all ${fillType === type ? 'bg-indigo-600/35 border-indigo-500 text-indigo-200 font-semibold' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'}`}
+                    >
+                      {type}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Background Theme Styles */}
+              <div className="border-t border-slate-800 pt-3">
+                <span className="text-xs font-semibold text-slate-300 block mb-2">Canvas Style</span>
+                <div className="flex gap-1.5">
+                  {['grid', 'dots', 'blank'].map((patt) => (
+                    <button
+                      key={patt}
+                      onClick={() => setBgPattern(patt)}
+                      className={`flex-1 py-1 rounded-lg border text-[10px] font-medium capitalize transition-all ${bgPattern === patt ? 'bg-indigo-600/35 border-indigo-500 text-indigo-200 font-semibold' : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-slate-200'}`}
+                    >
+                      {patt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Trash / Reset Workspace */}
+              <button
+                onClick={clearWorkspace}
+                className="w-full bg-rose-950/40 hover:bg-rose-900/50 border border-rose-900/60 text-rose-300 font-medium text-xs py-2 rounded-xl transition-all flex items-center justify-center gap-1.5"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                Clear Entire Canvas
+              </button>
+            </div>
+
+            {/* Quick Zoom Tools (Bottom Left Overlay) */}
+            <div className="absolute bottom-6 left-6 bg-[#131b2e]/90 backdrop-blur-md border border-slate-800 rounded-2xl p-1.5 flex items-center gap-1 z-20 shadow-xl">
+              <button 
+                onClick={handleZoomOut}
+                className="p-2 hover:bg-slate-800 text-slate-300 rounded-lg text-sm"
+                title="Zoom Out"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M20 12H4" /></svg>
+              </button>
+              
+              <button 
+                onClick={handleZoomReset}
+                className="px-3 py-1 hover:bg-slate-800 text-slate-300 rounded-lg text-xs font-semibold"
+                title="Reset Zoom"
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+
+              <button 
+                onClick={handleZoomIn}
+                className="p-2 hover:bg-slate-800 text-slate-300 rounded-lg text-sm"
+                title="Zoom In"
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 4v16m8-8H4" /></svg>
+              </button>
+            </div>
+          </main>
+
+          {/* Quick Help Status Bottom Right */}
+          <footer className="absolute bottom-6 right-6 bg-[#131b2e]/90 border border-slate-800 px-4 py-2 rounded-2xl z-20 shadow-xl max-w-xs text-center md:text-right hidden sm:block pointer-events-none">
+            <span className="text-[10px] text-slate-500 font-bold block uppercase tracking-wider">OmniBoard Workspace</span>
+            <span className="text-xs text-slate-300 font-medium block mt-0.5">Press <span className="px-1 py-0.5 bg-slate-800 border border-slate-700 rounded text-[10px] text-slate-200 font-mono">Delete</span> to erase selected element</span>
+          </footer>
+
+          {/* Cloud Boards Directory - Slider Drawer (Right) */}
+          {showLibrary && (
+            <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex justify-end transition-opacity duration-300">
+              <div className="w-full max-w-md bg-[#0f172a] h-full border-l border-slate-800 shadow-2xl p-6 flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between border-b border-slate-800 pb-4 mb-5">
+                    <div className="flex items-center gap-2">
+                      <svg className="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2" />
+                      </svg>
+                      <h2 className="text-lg font-bold text-slate-100">My Saved Canvases</h2>
+                    </div>
+                    <button 
+                      onClick={() => setShowLibrary(false)}
+                      className="p-1.5 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <p className="text-xs text-slate-400 mb-4 leading-relaxed">
+                    Select a canvas to load. All active drawings on these files automatically update in real-time.
+                  </p>
+
+                  {/* Boards List */}
+                  <div className="space-y-2 max-h-[60vh] overflow-y-auto pr-1">
+                    {boardsList.length === 0 ? (
+                      <div className="text-center py-10 text-slate-500 text-sm">
+                        No saved boards found.
+                      </div>
+                    ) : (
+                      boardsList.map((board) => (
+                        <div
+                          key={board.id}
+                          onClick={() => { loadBoard(board); setShowLibrary(false); }}
+                          className={`group w-full p-3.5 rounded-xl border flex items-center justify-between cursor-pointer transition-all ${currentBoardId === board.id ? 'bg-indigo-600/10 border-indigo-500/80' : 'bg-slate-900/50 border-slate-800 hover:bg-slate-800/40'}`}
+                        >
+                          <div className="flex-1 min-w-0 pr-3">
+                            <span className="font-semibold text-xs text-slate-200 group-hover:text-indigo-300 block truncate">
+                              {board.name || 'Untitled File'}
+                            </span>
+                            <span className="text-[10px] text-slate-500 block mt-1">
+                              Modified: {board.updatedAt ? new Date(board.updatedAt).toLocaleString() : 'N/A'}
+                            </span>
+                          </div>
+                          
+                          {/* Delete Board Icon */}
+                          <button
+                            onClick={(e) => deleteBoard(board.id, e)}
+                            className="opacity-0 group-hover:opacity-100 p-1.5 hover:bg-rose-950 hover:text-rose-400 text-slate-500 rounded-lg transition-all"
+                            title="Delete Board"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7" />
+                            </svg>
+                          </button>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+
+                <div className="border-t border-slate-800 pt-4 flex flex-col gap-2">
+                  <button
+                    onClick={() => { createNewBoard(); setShowLibrary(false); }}
+                    className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs py-3 rounded-xl transition-all"
+                  >
+                    + Create New Whiteboard
+                  </button>
+                  <button
+                    onClick={() => setShowLibrary(false)}
+                    className="w-full bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs py-2.5 rounded-xl transition-all"
+                  >
+                    Close Directory
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      );
+    }
+
+    // Mount application on DOM ready
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
